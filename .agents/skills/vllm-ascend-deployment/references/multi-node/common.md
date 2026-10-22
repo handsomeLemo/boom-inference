@@ -13,8 +13,8 @@
 1. **输入检查**：识别部署意图（**multi-node deployment** 或 **multi-node
    PD-disaggregated deployment**），并通过 SSH 验证每个输入节点存在、节点间可连通、
    模型路径存在，探测各节点 NPU 卡。
-2. **宿主机运行时预检**：在每个节点检查 Docker 镜像可用、容器执行权限和七项固定 Ascend
-   挂载源路径；任一节点失败时报告 `runtime_incomplete`，不启动任何容器。
+2. **宿主机运行时预检**：在每个节点检查 Docker 镜像或用户指定容器可用、容器执行权限
+   和七项固定 Ascend 挂载源路径；任一节点失败时报告 `runtime_incomplete`，不启动任何容器。
 3. **部署**：按部署类型读取对应模式文档，获得具体部署配置和部署策略，按其启动顺序通过
    SSH 在目标宿主机执行 `docker pull`/`docker run`，不得在 Agent/Pi 容器内操作 Docker daemon。
 4. **服务验收与报告记录**：按部署类型执行对应模式文档定义的验收策略；验收完成后
@@ -54,14 +54,19 @@ SSH 连接规则：端口使用用户明确指定的值，否则默认 `22`；�
 
 ## 2. 宿主机运行时预检
 
-在第 1 节建立 SSH 通道后，对每个节点确认用户指定的 Docker 镜像可用：
+在第 1 节建立 SSH 通道后，按用户提供的输入确认运行时：
+
+- 用户只提供**镜像**：对每个节点探测镜像是否可用；部署时每个节点默认创建一个容器，容器名为该节点的 IP 地址，若同名容器已存在则直接复用该容器，不再创建新容器；
+- 用户提供**容器名称**：对每个节点探测该容器是否可用，部署时直接复用该容器，不创建新容器。
+
+用户只提供镜像时，对每个节点确认镜像可用：
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=5 -p <ssh_port> <user>@<host> \
   "docker image inspect <image> --format '{{.RepoTags}}'"
 ```
 
-每个节点还检查已有容器执行权限：
+每个节点还检查已有容器和执行权限，并从中确认待复用的容器是否存在：
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=5 -p <ssh_port> <user>@<host> \
@@ -79,7 +84,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 -p <ssh_port> <user>@<host> \
    done'
 ```
 
-所有 Docker 操作都在目标宿主机上执行，通过对应节点的 SSH 连接；当前 Agent 所在节点本身就是目标节点时，该节点在宿主机本地执行、不经 SSH。不得在 Pi/Agent 容器内直接执行本地命令或启动 `dockerd`，也不得使用 `/var/run/docker.sock`、`DOCKER_HOST` 或本地 Docker context 绕过 SSH 边界。普通多机部署与PD分类多机部署对于docker容器的拉起可以采用相同的格式，8卡样例挂载命令模版如下：
+所有 Docker 操作都在目标宿主机上执行，通过对应节点的 SSH 连接；当前 Agent 所在节点本身就是目标节点时，该节点在宿主机本地执行、不经 SSH。不得在 Pi/Agent 容器内直接执行本地命令或启动 `dockerd`，也不得使用 `/var/run/docker.sock`、`DOCKER_HOST` 或本地 Docker context 绕过 SSH 边界。普通多机部署与 PD 分离多机部署创建新容器时采用相同的拉起格式，8 卡样例挂载命令
+模版如下；复用现有容器时不执行本模板，改用下方的 `docker exec` 模板：
 
 ```bash
 docker run --detach \
@@ -107,16 +113,27 @@ docker run --detach \
   --device /dev/davinci_manager \
   --device /dev/devmm_svm \
   --device /dev/hisi_hdc \
-  <image> <mode-specific-command>
+  <image> bash -lc 'source /root/.bashrc && exec <mode-specific-command> \
+    > /models/deployment/<log-filename> 2>&1'
+```
+
+复用现有容器时的模版：
+
+```bash
+docker exec --detach \
+  --env KEY=value \
+  <node-name> bash -lc 'source /root/.bashrc && exec <mode-specific-command> \
+    > /models/deployment/<log-filename> 2>&1'
 ```
 
 其中：
-- `<node-name>`：容器名称，默认使用当前机器的 IP 地址；
+- `<node-name>`：容器名称，默认使用当前机器的 IP 地址；`docker exec` 模板中为要复用的现有容器名；
 - `--volume <model_host_path>:/models/model:ro`：`<model_host_path>` 为该节点本地磁盘上的实际模型目录，只读挂载；每个加载模型的服务节点都必须有此挂载（普通多机为全部节点，PD 分离为全部 Prefill/Decode 节点，Proxy/Mooncake 不需要），且所有节点挂载到相同的容器内路径 `/models/model`；
 - `--volume /data/boom/deployment:/models/deployment`：宿主机日志目录，用于在宿主机读取容器的执行记录；服务日志写入容器内 `/models/deployment`；
 - `--device=/dev/davinci<N>`：挂载第 1 节在该节点探测确认的可用 NPU 卡；用户指定卡号时只挂载指定卡，未指定时挂载全部可用卡，模板中的 `davinci0`-`davinci7` 仅为 8 卡样例；
 - `<image>`：本节已确认可用的用户指定镜像；
-- `<mode-specific-command>`：容器内执行的服务启动命令，按部署类型读取对应模式文档生成的实际部署参数命令。
+- `<mode-specific-command>`：容器内执行的服务启动命令（如 `vllm serve` 及其参数），按部署类型读取对应模式文档生成；
+- `<log-filename>`：启动日志文件名，按对应模式文档的日志命名规则生成。
 
 任一检查失败时报告节点、原因和 `runtime_incomplete`，不启动任何容器。
 

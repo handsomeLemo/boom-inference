@@ -92,11 +92,17 @@ Docker 的公共网络、Ascend 挂载、模型挂载、日志目录和设备参
 `/dev/davinci_manager`、`/dev/devmm_svm` 和 `/dev/hisi_hdc`；不能在 Agent/Pi 容器内
 直接执行。
 
+容器按 `common.md` 第 2 节的输入分支确认：用户提供镜像且目标容器不存在时，按上述
+模板创建新容器，容器名默认为该节点的 IP 地址；用户提供了容器名称、或同名容器已
+存在时，直接复用现有容器，不执行 `docker run`。复用时按 `common.md` 第 2 节的
+`docker exec` 模板执行，`--env` 环境变量和 `bash -lc` 启动命令使用本节对应角色
+（Master/Worker）的相同内容。
+
 以下值必须在生成启动命令前确认，不能从未提供或无法只读确认的环境中猜测：
 
 | 参数 | 普通多机规则 |
 |---|---|
-| `image` | 用户提供，每个节点使用用户指定镜像 |
+| `image` | 用户提供，每个节点使用用户指定镜像；仅在创建新容器时使用 |
 | `model_path` | 容器内统一路径，固定为 `/models/model`；各节点的宿主机模型路径只出现在 `<common-docker-args>` 的挂载参数中 |
 | `served_model_name` | Master 和所有 Worker 一致 |
 | `master_node_ip` | Master 的数据面 IP；所有 Worker 可访问 |
