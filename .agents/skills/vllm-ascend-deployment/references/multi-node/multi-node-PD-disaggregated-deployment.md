@@ -1,290 +1,395 @@
 # multi-node PD-disaggregated deployment
 
-本文件定义 **multi-node PD-disaggregated deployment**。当前版本使用固定的
-PD 部署方案，不在运行时自动选择其他 connector。最终服务计划属于当前 attempt，
-并由主 Skill 统一写入 `deployment_report.json`。
+本文件定义多机 Prefill/Decode（PD）分离的部署方法。SSH、Docker 宿主机边界、Ascend
+挂载、节点预检、公共清理、业务请求和报告格式遵循上层 Skill 与 common.md；本文件只负责
+PD 的 connector 选择、P/D 拓扑、KV 服务、Proxy 命令和启动后 PD 状态检查。
 
-## 固定服务结构
+本文件的模型→connector 映射、connector JSON 配置模板、并行参数、环境变量、Proxy 方向和
+Mooncake 服务要求以 vLLM-Ascend v0.26 官方教程、特性文档和 e2e 配置为基准。
 
-```text
-Mooncake master
-      │ TCP readiness
-      ├──────────────────┐
-Prefill workers      Decode workers
-      └─────────┬────────┘
-                ↓
-              Proxy ── 对外 OpenAI API
-```
+## 部署流程（总览）
 
-- Mooncake master 是独立容器；Skill 必须取得已确认的镜像、argv、配置和监听端口，不能根据 connector 名称猜测启动命令。
-- Prefill 和 Decode 是 vLLM-Ascend 容器，使用本文件规定的参数和 KV Transfer 配置。
-- Proxy 是独立容器；Skill 必须取得已确认的 argv 和 Prefill/Decode 后端地址。
-- Prefill/Decode 依赖 Mooncake master，Proxy 依赖全部 Prefill/Decode worker。
+先按 `common.md` 完成节点、镜像、模型目录、挂载、设备、网卡和端口预检，再按以下
+顺序执行 PD 分离部署的专属流程：
 
-Skill 必须把 Mooncake master、Prefill、Decode 和 Proxy 四类服务都展开到部署计划中。
+1. **服务图与 connector 选择**：按 1.2 映射表和 1.3 选择规则确定 connector，由
+   connector 确定 Proxy 方向和是否需要 Mooncake KV Pool 服务。
+2. **并行策略**：采用节点内 TP、节点间 DP，确定每个角色的节点数、TP 和 rank 分配。
+3. **通信环境变量**：按第 3 节为每个 P/D 容器生成环境变量，实际值按所在节点和
+   角色展开。
+4. **Connector 配置与 KV 服务要求**：按第 4 节生成 P/D 两侧共用的
+   `--kv-transfer-config` JSON（仅 `kv_role` 不同）；池化组合另需 `mooncake.json`。
+5. **配置参数和部署命令**：按第 5 节参数表确定取值并生成启动命令（所有占位符必须
+   解析，不能原样发送）；仅池化组合先启动 Mooncake Master 并通过 readiness；然后
+   按依赖顺序启动全部 Prefill 和 Decode，逐个确认容器存活、vLLM 启动完成、日志无
+   connector / KV 传输相关报错；全部就绪后按 5.4 为选定 connector 启动Proxy。
+6. **启动后 PD 状态检查**：统一检查全部 P/D、Proxy 和池化组合的 Mooncake Master，
+   在最小业务请求的时间窗口内确认请求实际经过 Prefill 和 Decode；
 
-## 启动前必须确认的输入
+任一本地检查失败时，停止生成或启动命令，报告节点、检查项和原因。
 
-| 输入 | 要求 |
+## 1. 服务图与 connector 选择（v0.26 基准）
+
+### 1.1 服务图
+
+~~~text
+除池化组合外的 connector（无独立 KV 服务）:
+  Prefill workers ──┐
+  Decode workers ───┼── Proxy ── 对外 OpenAI API
+
+池化组合:
+  Mooncake Master ──┬── Prefill workers ──┐
+                    └── Decode workers ───┼── Proxy ── 对外 OpenAI API
+~~~
+
+每个 Prefill / Decode 角色按第 2 节展开一个或多个容器。
+
+默认节点分配：agent 所在节点运行 Prefill、Proxy 和 Mooncake Master（仅池化组合），
+Decode 运行在其他节点（单机部署时 P/D 同节点）；agent 所在节点不在本次部署的节点
+列表中时，由 agent 按节点资源和用户需求自行分配各容器所在节点，并在部署计划中
+记录。
+
+### 1.2 模型 → connector 映射
+
+下表是 connector 选择的唯一依据；P/D 拓扑（DP/TP/节点数）按第 2 节计算。量化规则见第 5 节参数表。
+
+| connector | 模型权重 |
 |---|---|
-| `deployment_id` | 由 Skill 根据当前 attempt 自动生成，用户不需要提供 |
-| `image` | 所有 P/D 节点使用内容一致的 vLLM-Ascend 镜像，且支持本文件规定的三个 connector；Mooncake/Proxy 可按服务单独覆盖 |
-| `model_path` | 所有 P/D 节点可访问，容器内路径一致 |
-| `served_model_name` | Prefill、Decode 和 Proxy 使用同一名称 |
-| `prefill_nodes` | 每项包含节点、rank、数据面 IP、NPU、TP 和 API 端口 |
-| `decode_nodes` | 每项包含节点、rank、数据面 IP、NPU、TP 和 API 端口 |
-| `mooncake_master` | 镜像、argv、配置文件、监听地址、端口和 TCP readiness |
-| `proxy` | 镜像、argv、监听地址、端口、P/D 后端和 HTTP readiness |
-| `network_interface` | 所有通信节点的实际数据面网卡 |
-| `request` | 最终通过 Proxy 发送的最小 completion 请求 |
+| `MooncakeConnectorV1` | DeepSeek-V3 / V3.1、DeepSeek-V3.2、GLM-5、GLM-5.1、GLM-5.2（A3）、Kimi-K2.6、MiniMax-M2、MiniMax-M2.5、Qwen3-235B-A22B、Qwen3-VL-235B、Qwen3.5-397B-A17B、Qwen3.5-27B、Qwen3.6-27B、Qwen2.5-VL-7B（单机 1P1D） |
+| `MooncakeHybridConnector` | DeepSeek-V4-Pro、DeepSeek-V4-Flash |
+| `MooncakeLayerwiseConnector` | DeepSeek-V3.1-Terminus |
+| `MultiConnector` = `MooncakeConnectorV1` + `AscendStoreConnector(backend=mooncake)` | GLM-5.2（8×Atlas 800 A2） |
 
-下面列出的默认值由 Skill 自动写入部署计划，不要求用户逐项输入。只有用户明确覆盖、端口冲突或已确认运行模板要求其他值时才修改。
+### 1.3 connector 选择规则
 
-## 服务图
+按以下优先级确定 connector：
 
-计划至少包含：
+1. 用户明确指定 connector（包括明确要求 MultiConnector 或某个池化组合）时，采用用户所指定的connector。
+2. 用户未指定、模型在 1.2 表中时，选择表对应行的 connector；同一模型多行时按硬件
+   档位确定一行。
+3. 用户未指定、模型不在 1.2 表中时，停止并报告。
 
-```json
+用户需求映射：
+
+| 用户表达 | connector |
+|---|---|
+| “普通 P/D”“先跑通 P 到 D” | 按 1.2 表选择 |
+| “layerwise”“逐层传输” | `MooncakeLayerwiseConnector` |
+| “需要 Mooncake KV Pool”“前缀 KV 复用并使用 Mooncake” | `MultiConnector` = `MooncakeConnectorV1` + `AscendStoreConnector(backend=mooncake)` |
+
+只有带 `AscendStoreConnector` 的组合才是 KV Pool。connector 名称包含 Mooncake 不等于需要
+KV Pool，不能因此自动增加 `AscendStoreConnector`、Mooncake Master、`mooncake.json`
+或 `MOONCAKE_CONFIG_PATH`——这些只属于池化组合。
+
+## 2. 并行策略
+
+Prefill 和 Decode 是两个独立的并行组，各自确定 TP 和节点数，两组拓扑可以不同。本文件
+只采用**节点内 TP、节点间 DP**：每个节点内选中的全部 NPU 构成一个 rank，
+`--tensor-parallel-size` 为该节点的选卡数；每个节点是一个 DP rank，不使用 PP、EP 或
+跨节点 TP。
+
+- 某角色只有 1 个节点（单机 1P1D 或 1P1D 双机）时，命令行只保留
+  `--tensor-parallel-size`，不加任何 `--data-parallel-*` 参数；
+- 某角色有多个节点时，每个节点一个 `vllm serve`，在 `--tensor-parallel-size` 后追加
+  `--data-parallel-size <该角色节点数> --data-parallel-rank <本节点序号> --data-parallel-address <该角色 rank 0 节点 IP> --data-parallel-rpc-port <端口>`
+  （rpc-port 同角色一致，默认 `12321`）；
+- connector 配置中 `prefill` / `decode` 段的 `dp_size` 填该角色节点数（单节点为
+  1），`tp_size` 填该节点的 NPU 数（与 `--tensor-parallel-size` 一致），必须与 CLI
+  实际拓扑一致。
+
+## 3. 通信环境变量
+
+Prefill 和 Decode 使用相同的通信环境变量结构，实际值按所在节点和角色展开：
+
+~~~bash
+--env ASCEND_RT_VISIBLE_DEVICES=<role_devices>
+--env HCCL_IF_IP=<role_node_ip>
+--env HCCL_SOCKET_IFNAME=<role_network_interface>
+--env GLOO_SOCKET_IFNAME=<role_network_interface>
+--env TP_SOCKET_IFNAME=<role_network_interface>
+--env OMP_PROC_BIND=false
+--env OMP_NUM_THREADS=1
+--env HCCL_BUFFSIZE=256
+--env HCCL_OP_EXPANSION_MODE=AIV
+--env TASK_QUEUE_ENABLE=1
+--env PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+~~~
+
+## 4. Connector 配置与 KV 服务要求
+
+`--kv-transfer-config` 的值是一段 JSON；本节给出各 connector 的 JSON 模板，`<...>`
+占位符由部署计划解析。P 和 D 两侧用同一个 JSON，差异只有 `kv_role`（P 侧
+`kv_producer`，D 侧 `kv_consumer`）和池化组合的 `lookup_rpc_port`。JSON 原文内联在命令的
+`--env KV_TRANSFER_CONFIG='...'` 行里，不生成文件。
+
+### 4.1 单 connector：`MooncakeConnectorV1` / `MooncakeHybridConnector` / `MooncakeLayerwiseConnector`
+
+~~~json
 {
-  "services": [
-    {
-      "id": "mooncake",
-      "role": "mooncake_master",
-      "depends_on": []
+  "kv_connector": "MooncakeConnectorV1 或 MooncakeHybridConnector 或 MooncakeLayerwiseConnector",
+  "kv_role": "kv_producer 或 kv_consumer",
+  "kv_port": "<role_kv_port>",
+  "engine_id": "<unique_engine_id>",
+  "kv_connector_extra_config": {
+    "use_ascend_direct": true,
+    "prefill": {
+      "dp_size": <prefill_dp>,
+      "tp_size": <prefill_tp>
     },
-    {
-      "id": "prefill-0",
-      "role": "prefill",
-      "depends_on": ["mooncake"]
-    },
-    {
-      "id": "decode-0",
-      "role": "decode",
-      "depends_on": ["mooncake"]
-    },
-    {
-      "id": "proxy",
-      "role": "proxy",
-      "depends_on": ["prefill-0", "decode-0"]
+    "decode": {
+      "dp_size": <decode_dp>,
+      "tp_size": <decode_tp>
     }
-  ]
+  }
 }
-```
+~~~
 
-存在多个 Prefill 或 Decode rank 时，Proxy 必须依赖全部 P/D 服务；Proxy 的 HTTP 后端只包含所选模式实际提供 API 的服务。
+三种 connector 共用这个 JSON，只有 `kv_connector` 的取值不同。
 
-## 固定默认值
+### 4.2 `MultiConnector` 池化组合（KV Pool）
 
-| 参数 | Prefill | Decode |
-|---|---:|---:|
-| API port | `7100` | `7100` |
-| KV port | `30000` | `30200` |
-| DP RPC port | `12321` | `12321` |
-| `data_parallel_size_local` | `1` | `1` |
-| `max_model_len` | `4096` | `4096` |
-| `max_num_seqs` | `32` | `32` |
-| `max_num_batched_tokens` | `4096` | `256` |
-| `gpu_memory_utilization` | `0.9` | `0.9` |
-| `no_disable_hybrid_kv_cache_manager` | `true` | `true` |
-| `enforce_eager` | `true` | 不设置 |
-| `compilation_config` | 不设置 | `{"cudagraph_mode":"FULL_DECODE_ONLY"}` |
-
-同一个 API 或 RPC 端口可以在不同节点复用；同一节点存在冲突时必须显式覆盖。默认不增加下列模型专属参数：
-
-```text
---trust-remote-code
---quantization
---tokenizer-mode
---tool-call-parser
---reasoning-parser
-```
-
-只有用户输入、模型元数据或已确认运行模板提供依据时才加入这些参数。
-
-## DP 入口选择与拓扑参数
-
-Pi 分别计算 Prefill 和 Decode 的 `role_dp_size`（该角色的 rank 数量），结合 Proxy 实际支持的后端形式及目标镜像的已验证启动模板，为两个角色分别选择入口模式：
-
-| 条件 | 模式 | Proxy 使用的后端 |
-|---|---|---|
-| `role_dp_size = 1` | `single` | 该角色唯一的 API 地址 |
-| `role_dp_size > 1`，Proxy 只接该角色一个 API 入口，且镜像支持内部 DP | `internal` | 该角色对外提供 API 的入口；其他 rank 为 headless worker |
-| `role_dp_size > 1`，Proxy 能管理每个 rank，且镜像和模型支持外部 DP LB | `external` | 该角色所有 rank 的 API 地址 |
-
-用户明确指定模式时先检查上述条件；条件不成立时报告冲突，不为满足模式要求虚增 DP size。没有明确指定时，Pi 根据已确认的 Proxy 模板和镜像模板选择，并在 `deployment-plan.json` 的 `runtime.pd_endpoint_modes` 中分别记录 Prefill/Decode 的模式、依据和 API 后端；每个服务的最终 argv 写入对应的 `services[].argv`。模板信息不足时先补充证据，不猜测 rank 参数。
-
-每个 P/D 服务都按实际拓扑设置 `--tensor-parallel-size`。其余 DP 参数按所选模式展开：
-
-- `single`：默认省略所有 DP 参数；若已确认的镜像模板要求，可显式设置 `--data-parallel-size 1 --data-parallel-size-local 1`。不加 `--data-parallel-rank`、`--data-parallel-start-rank`、`--headless`，也不启用 external LB。除非镜像模板要求，不加 DP address/RPC 参数。
-- `internal`：设置该角色的 `--data-parallel-size <role_dp_size>`、`--data-parallel-size-local 1`、rank 0 的 `--data-parallel-address` 和同组一致的 `--data-parallel-rpc-port`。入口进程提供 API；其他 rank 按镜像模板使用 `--data-parallel-start-rank <rank> --headless`。rank 0 是否显式写 `--data-parallel-start-rank 0` 也以目标镜像模板为准，不能仅凭 rank 号推断。
-- `external`：仅当 `role_dp_size > 1` 且镜像、模型和 Proxy 均确认支持时使用；每个 rank 设置 `--data-parallel-size <role_dp_size> --data-parallel-size-local 1 --data-parallel-rank <rank>`，同组使用 rank 0 的 DP address 和一致的 RPC port，每个 rank 提供独立 API。不得加 `--headless`。
-
-1P1D 的两组都选 `single`；例如 2P1D 可以为 Prefill 选择 `internal`、为 Decode 选择 `single`。Prefill 与 Decode 各自计算 DP size，不能把两种角色相加来满足 external LB 的 `DP size > 1` 要求。
-
-表中的 DP RPC 默认端口仅在所选模式或已确认的镜像模板需要 RPC 参数时使用；`single` 不因存在该默认值而自动生成 RPC 参数。
-
-生成前必须校验：
-
-1. Prefill 和 Decode 都至少有一个服务；
-2. 每个角色的 rank 从 `0` 连续递增，不能重复或缺失；
-3. rank 对应节点的数据面 IP 与该角色地址列表一致；
-4. 当前 MVP 中 Prefill/Decode 的 TP 大小一致，且不超过对应节点 NPU 数量；
-5. 同一节点上的 API、KV、DP RPC、Mooncake 和 Proxy 端口没有冲突；
-6. Proxy 能访问两种角色在部署计划中选定的 API 后端；headless worker 不得作为 HTTP 后端。
-
-## 固定 KV Transfer 配置
-
-当前版本固定使用：
-
-```text
-MultiConnector
-├── MooncakeHybridConnector
-└── AscendStoreConnector
-```
-
-每个 P/D 服务的 `--kv-transfer-config` 按下面的模板生成：
-
-```json
+~~~json
 {
   "kv_connector": "MultiConnector",
-  "kv_role": "<kv_role>",
-  "engine_id": "<engine_id>",
+  "kv_role": "kv_producer 或 kv_consumer",
   "kv_connector_extra_config": {
     "connectors": [
       {
-        "kv_connector": "MooncakeHybridConnector",
-        "kv_role": "<kv_role>",
-        "kv_port": "<kv_port>",
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "<same_role>",
+        "kv_port": "<role_kv_port>",
         "kv_connector_extra_config": {
           "use_ascend_direct": true,
           "prefill": {
-            "dp_size": "<prefill_dp_size>",
-            "tp_size": "<tp_size>"
+            "dp_size": <prefill_dp>,
+            "tp_size": <prefill_tp>
           },
           "decode": {
-            "dp_size": "<decode_dp_size>",
-            "tp_size": "<tp_size>"
+            "dp_size": <decode_dp>,
+            "tp_size": <decode_tp>
           }
         }
       },
       {
         "kv_connector": "AscendStoreConnector",
-        "kv_role": "<kv_role>",
+        "kv_role": "<same_role>",
         "kv_connector_extra_config": {
-          "lookup_rpc_port": "<lookup_rpc_port>",
-          "backend": "mooncake"
+          "backend": "mooncake",
+          "lookup_rpc_port": "<lookup_rpc_port>"
         }
       }
     ]
   }
 }
-```
+~~~
 
-角色字段固定映射如下：
+- 子 connector 的 `kv_role` 与外层一致；`MooncakeConnectorV1` 负责实时 KV 传输，
+  `AscendStoreConnector` 负责前缀 KV 池；`lookup_rpc_port` 是 `AscendStoreConnector`
+  的内部 RPC 端口，P 侧填 `"0"`，D 侧填 `"1"`。
 
-| 角色 | `kv_role` | `engine_id` | 默认 `kv_port` | `lookup_rpc_port` |
-|---|---|---|---:|---:|
-| Prefill | `kv_producer` | `PREFILL_ENGINE` | `30000` | `0` |
-| Decode | `kv_consumer` | `DECODE_ENGINE` | `30200` | `1` |
+### 4.3 Mooncake 传输引擎与 KV Pool 服务
 
-`prefill.dp_size`、`decode.dp_size` 和 `tp_size` 必须来自本次已校验的拓扑，不能从示例复制。
+`mooncake.json` 是镜像里没有的配置文件，需要自己创建，只读挂载进
+容器并用 `MOONCAKE_CONFIG_PATH` 指向容器内路径，且只有池化组合需要。
 
-启动前必须确认镜像同时支持：
+**仅池化组合（`MultiConnector` 带 `AscendStoreConnector(backend=mooncake)`）追加**：
 
-```text
-MultiConnector
-MooncakeHybridConnector
-AscendStoreConnector
-```
+1. 所有 P/D 节点统一 `--env PYTHONHASHSEED=0`（官方要求全节点一致）；
+2. `mooncake.json` 只读挂载并 `--env MOONCAKE_CONFIG_PATH=<容器内路径>`，内容固定
+   如下（`master_server_address` 填 Mooncake Master 的 IP:端口，默认 `50088`，与
+   5.1 的 `--port` 一致）：
 
-如果镜像只支持 `MooncakeConnectorV1` 或 `MooncakeLayerwiseConnector`，报告镜像与当前 Skill 模板不兼容；不要自动替换 connector 后继续部署。
+~~~json
+{
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "ascend",
+  "device_name": "",
+  "master_server_address": "<mooncake_master_ip>:<mooncake_service_port>",
+  "global_segment_size": "<per-card 注册内存，默认 1GB，须 1GB 对齐>",
+  "preferred_segment": false,
+  "prefer_alloc_in_same_node": true
+}
+~~~
 
-## KV Connector 检查
+3. Mooncake Master 单节点运行（启动命令见 5.1），`master_server_address` 与 Master
+   监听端口对齐。
 
-检查分为两层：
+如果更换 connector 或镜像，先重新确认 connector 及其服务依赖，再生成本次部署命令；
+不能在启动过程中临时删除或替换选定 connector 的环境变量。
 
-1. 启动 Proxy 前，对每个 P/D 容器执行启动门禁：
-   - 使用 `docker inspect` 核对实际 argv 中的 `--kv-transfer-config` 与计划一致，包括 connector 名称、`kv_role`、`engine_id`、P/D 的 DP/TP 大小、`kv_port`、`lookup_rpc_port` 和 Mooncake backend；
-   - 确认 Mooncake master 的计划端口可从 P/D 节点访问；
-   - 在有界时间内确认 P/D 进程未退出，并检查启动日志中没有 connector 创建失败、Mooncake/AscendStore 初始化失败、无法连接或发现远端 engine、KV 传输失败等错误；
-   - 如果已确认的镜像模板提供 connector 健康接口或明确的初始化成功日志，再把它加入计划并检查。没有该证据时，不得自行猜测成功日志；部分实现会在首个业务请求时才完成初始化。
-2. Proxy ready 后，通过 Proxy 发送计划中的最小 completion。请求必须实际经过计划中的 Prefill 和 Decode 后端，不能用直接请求单个 P/D 服务代替。检查请求成功、响应非空，并确认请求期间 P/D 日志没有 KV 获取、发送、远端 engine 查询或等待 P side ready 失败。
+## 5. 配置参数和部署命令
 
-第一层只证明配置正确且启动阶段没有已知错误；第二层通过完整 P→D 请求验证实际 KV 传输。两层都通过后，才能认定 connector 链路可用。若镜像日志包含可关联的请求 ID，将 P/D 两侧对应日志摘要写入 `deployment_report.json`；没有稳定请求 ID 时，至少保存验证时间窗口内的 P/D 日志摘要和 Proxy 请求结果。
+下面的代码块都是完整的 `docker run` 模板。`<common-pd-docker-args>` 表示 common.md
+中的模型服务外壳，包括网络、Ascend 挂载、模型挂载、部署目录挂载和 NPU 设备参数，
+必须在执行前替换，不能原样发送给 Docker。Mooncake Master 和 Proxy 容器不继承模型
+服务外壳，只加 `--network host`。
 
-## vLLM 命令
+P/D 模板的 env 唯一例外是池化组合（`MultiConnector` = V1 +
+`AscendStoreConnector(backend=mooncake)`）：其 P/D 容器在 env 块后追加
+`--env PYTHONHASHSEED=0` 和 `--env MOONCAKE_CONFIG_PATH=<容器内路径>`，并把
+`mooncake.json` 只读挂载到该路径（见 4.3）。
 
-每个 P/D 容器的最终 argv 必须完整写入计划，基本形状为：
+生成启动命令前先按下表确定各参数取值：
 
-```text
-vllm serve <model_container_path>
---host 0.0.0.0
---port <api_port>
---served-model-name <served_model_name>
---tensor-parallel-size <tp_size>
-<按该角色的 single/internal/external 模式展开 DP 参数>
---max-model-len 4096
---max-num-seqs 32
---max-num-batched-tokens <role_default>
---gpu-memory-utilization 0.9
---no-disable-hybrid-kv-cache-manager
-<prefill_enforce_eager_or_decode_compilation_config>
---kv-transfer-config <role_json>
-```
+| 参数 | 含义和默认值 |
+|---|---|
+| prefill_kv_port / decode_kv_port | KV 传输端口；未指定时默认 30000 / 30200。必须避开 AscendDirectTransport 随机端口区（从 20000 起、每卡预留 1000 个端口）：8 卡节点选 ≥28000，16 卡节点选 ≥36000 |
+| engine_id | 引擎标识，字符串；同一节点上多个进程时互不相同，跨节点允许重复。默认按节点序号填 `"0"`、`"1"`、`"2"`… |
+| prefill_api_port / decode_api_port | Prefill / Decode 对外 API 端口；必须在部署计划中指定 |
+| max_model_len | P/D 两侧一致；用户指定时用用户值，未指定时默认 `4096`，不超过模型上下文上限 |
+| max_num_seqs | 用户指定时用用户值，未指定时默认 `64` |
+| max_num_batched_tokens | 默认值，用户明确指定时才写入对应侧命令 |
+| gpu_memory_utilization | 用户指定时用用户值，未指定时默认 `0.9` |
+| quantization | 用户权重为 Ascend 量化格式（w8a8 / w4a8 等）时，P/D 两侧加 `--quantization ascend` |
+| Mooncake 服务参数 | 仅池化组合；按 4.3 和 5.1 的固定值 |
 
-每个容器使用稳定名称：
+计划必须记录：
 
-```text
-boom-skill-<deployment_id>-mooncake
-boom-skill-<deployment_id>-prefill-<rank>
-boom-skill-<deployment_id>-decode-<rank>
-boom-skill-<deployment_id>-proxy
-```
+- Prefill 和 Decode 的节点、rank、NPU、TP、DP、API 和 KV 端口；
+- 只有选定 connector 需要的 KV 服务节点、容器、监听端口和配置文件；
+- Proxy 节点、监听端口、Proxy 方向（P-first / D-first）和 P/D 后端列表；
+- 模型路径、served model name、镜像 digest；
+- 池化组合才记录：`mooncake.json` 宿主机路径和容器路径、Mooncake Master
+  节点与端口；
+- connector 配置和必要环境变量；
+- 最小 completion 请求。
 
-Docker 挂载、设备、标签和所有权规则读取 [common.md](common.md)。使用 NPU 的 Prefill/Decode 必须映射计划中的 NPU 和共享设备；Mooncake master、Proxy 是否使用 NPU 由其已确认的运行模板决定。
+### 5.1 Mooncake Master（仅池化组合）
 
-## 启动顺序
+非池化组合不生成本节容器。v0.26 官方命令模板：
 
-1. 检查所有节点的 SSH、Docker、镜像、模型挂载、Ascend 挂载、NPU 和端口；
-2. 启动 Mooncake master；
-3. 等待 Mooncake master TCP readiness；
-4. 并行启动全部 Prefill 和 Decode worker；
-5. 按选定模式等待全部 P/D 服务就绪：API 入口检查端口和模型身份；headless worker 检查进程、rank、DP 通信和模型加载日志；按“KV Connector 检查”的第一层完成启动门禁；
-6. 启动 Proxy；
-7. 等待 Proxy HTTP readiness；
-8. 通过 Proxy 发送最小 completion。
+~~~bash
+docker run --detach \
+  --name mooncake-master-<node-name> \
+  --network host \
+  <image> bash -lc 'exec mooncake_master \
+    --port <mooncake_service_port> \
+    --eviction_high_watermark_ratio 0.9 \
+    --eviction_ratio 0.1 \
+    --default_kv_lease_ttl 11000 \
+    --enable_offload=false \
+    --client_ttl 120'
+~~~
 
-Mooncake master 未 ready 时不得启动 P/D，任一 P/D 未 ready 时不得启动 Proxy。
+- Master 只需在一个节点运行；`--port` 必须与 `mooncake.json` 的
+  `master_server_address` 一致；
+- 上述数值为 v0.26 官方示例值；`--default_kv_lease_ttl` 应大于
+  `ASCEND_CONNECT_TIMEOUT` 和 `ASCEND_TRANSFER_TIMEOUT`；
+- 只有池化组合需要先通过 TCP `<mooncake_service_port>` readiness；P/D connector 配置
+  继续使用各自的 `prefill_kv_port` / `decode_kv_port`，不能把 KV 传输端口改成
+  Mooncake Master 的控制端口。
 
-## 验证
+### 5.2 Prefill
 
-只有以下检查全部通过才能报告 `ready`：
+~~~bash
+docker run --detach \
+  --name prefill-<rank>-<node-name> \
+  <common-pd-docker-args> \
+  --env ASCEND_RT_VISIBLE_DEVICES=<role_devices> \
+  --env HCCL_IF_IP=<role_node_ip> \
+  --env HCCL_SOCKET_IFNAME=<role_network_interface> \
+  --env GLOO_SOCKET_IFNAME=<role_network_interface> \
+  --env TP_SOCKET_IFNAME=<role_network_interface> \
+  --env OMP_PROC_BIND=false \
+  --env OMP_NUM_THREADS=1 \
+  --env HCCL_BUFFSIZE=256 \
+  --env HCCL_OP_EXPANSION_MODE=AIV \
+  --env TASK_QUEUE_ENABLE=1 \
+  --env PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
+  --env KV_TRANSFER_CONFIG='<prefill_connector_config>' \
+  <image> bash -lc 'source /root/.bashrc && exec vllm serve /models/model \
+    --host 0.0.0.0 --port <prefill_api_port> \
+    --tensor-parallel-size <prefill_tp> \
+    <prefill_dp_args> \
+    --served-model-name <served_model_name> \
+    --max-model-len <prefill_max_model_len> --max-num-seqs <prefill_max_num_seqs> \
+    --gpu-memory-utilization <gpu_memory_utilization> \
+    --trust-remote-code \
+    --kv-transfer-config "$KV_TRANSFER_CONFIG"'
+~~~
 
-- Mooncake master 容器、进程和 TCP 端口正常；
-- 所有 Prefill/Decode 容器带正确标签且处于运行状态；
-- P/D rank 覆盖完整，实际参数与计划一致；
-- Prefill 使用 `kv_producer`，Decode 使用 `kv_consumer`；
-- 两侧均使用 `MultiConnector`、`MooncakeHybridConnector` 和 `AscendStoreConnector`；
-- KV connector 的实际配置与计划一致，启动日志没有未处理的 connector、Mooncake 或 AscendStore 错误；
-- 提供 API 的 Prefill/Decode 入口返回预期模型身份；headless worker 的模型加载、rank 和 DP 通信检查通过；
-- Proxy 后端列表与计划中所选模式的 API 地址一致，且没有 headless worker；
-- 通过 Proxy 的最小 completion 成功且返回非空结果，请求期间 P/D 日志没有 KV 传输错误。
+`<prefill_connector_config>` 替换为 4.1 / 4.2 中选定 connector 的 JSON 原文；
+`<prefill_dp_args>` 按第 2 节生成：单节点角色为空，多节点角色为完整
+`--data-parallel-*` 参数串。
 
-只验证容器和端口不能证明 PD 链路成功。Mooncake、P/D 或 Proxy 单独健康，但最终 completion 失败时必须报告 `partially_started`。
+### 5.3 Decode
 
-## 失败处理
+~~~bash
+docker run --detach \
+  --name decode-<rank>-<node-name> \
+  <common-pd-docker-args> \
+  --env ASCEND_RT_VISIBLE_DEVICES=<role_devices> \
+  --env HCCL_IF_IP=<role_node_ip> \
+  --env HCCL_SOCKET_IFNAME=<role_network_interface> \
+  --env GLOO_SOCKET_IFNAME=<role_network_interface> \
+  --env TP_SOCKET_IFNAME=<role_network_interface> \
+  --env OMP_PROC_BIND=false \
+  --env OMP_NUM_THREADS=1 \
+  --env HCCL_BUFFSIZE=256 \
+  --env HCCL_OP_EXPANSION_MODE=AIV \
+  --env TASK_QUEUE_ENABLE=1 \
+  --env PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
+  --env KV_TRANSFER_CONFIG='<decode_connector_config>' \
+  <image> bash -lc 'source /root/.bashrc && exec vllm serve /models/model \
+    --host 0.0.0.0 --port <decode_api_port> \
+    --tensor-parallel-size <decode_tp> \
+    <decode_dp_args> \
+    --served-model-name <served_model_name> \
+    --max-model-len <decode_max_model_len> --max-num-seqs <decode_max_num_seqs> \
+    --gpu-memory-utilization <gpu_memory_utilization> \
+    --trust-remote-code \
+    --kv-transfer-config "$KV_TRANSFER_CONFIG"'
+~~~
 
-失败时记录最后一份 readiness、相关日志摘要和失败命令。只停止和删除同时满足以下标签的容器：
+`<decode_connector_config>` 替换为 4.1 / 4.2 中选定 connector 的 JSON 原文；
+`<decode_dp_args>` 按第 2 节生成：单节点角色为空，多节点角色为完整
+`--data-parallel-*` 参数串。
 
-```text
-boom.skill.owner=standalone-skill
-boom.skill.deployment_id=<deployment_id>
-```
+### 5.4 Proxy
 
-按逆依赖顺序清理：
+v0.26 官方提供两个 Proxy 脚本（位于 vllm-ascend 仓库 `examples/disaggregated_prefill_v1/`），
+参数结构完全相同，**请求路由方向不同**，必须按选定 connector 选择：
 
-```text
-Proxy → Decode/Prefill → Mooncake master
-```
+| connector | Proxy 脚本 | 路由行为 |
+|---|---|---|
+| `MooncakeConnectorV1`、`MooncakeHybridConnector`、池化组合 `MultiConnector` | `load_balance_proxy_server_example.py` | 请求先路由到 Prefill 节点完成预填充，再转交 Decode 节点续写 |
+| `MooncakeLayerwiseConnector` | `load_balance_proxy_layerwise_server_example.py` | 请求先路由到 Decode 节点，Decode 按需从 Prefill 逐层拉取 KV |
 
-禁止使用 `pkill`、宽范围 `docker rm`、猜测容器 ID 或通过端口占用者推断所有权。
+~~~bash
+docker run --detach \
+  --name proxy-<node-name> \
+  --network host \
+  --env http_proxy= --env https_proxy= \
+  <proxy_script_mount_if_needed> \
+  <proxy_image> bash -lc 'exec python <proxy_script> \
+    --host <proxy_host> \
+    --port <proxy_port> \
+    --prefiller-hosts <prefill_backend_hosts> \
+    --prefiller-ports <prefill_backend_ports> \
+    --decoder-hosts <decode_backend_hosts> \
+    --decoder-ports <decode_backend_ports>'
+~~~
+
+- `<proxy_script>` 按上表选择；镜像已内置脚本时 `<proxy_script_mount_if_needed>` 为空，
+  脚本在宿主机时才以只读方式挂载；
+- Proxy 官方指南默认部署在 Prefill 节点，也可用任何能访问全部 P/D 后端的节点；启动前
+  必须清空 `http_proxy` / `https_proxy` 环境变量，避免请求转发经过外部代理；
+
+## 6. 启动后 PD 状态检查
+
+本节对应部署流程第 6 步，只检查 PD 分离部署的链路专属状态，不重复公共输入检查、
+Docker 预检、清理或公共业务验收：
+
+- 所有 Prefill / Decode 容器处于运行状态，vLLM 启动完成，日志无 connector / KV
+  传输相关报错；
+- Proxy 容器处于运行状态，返回成功；
+- 在 `common.md` 第 4 节最小业务请求（PD 部署的公共入口是 Proxy）的时间窗口内，
+  Prefill 和 Decode 两侧日志均有该请求的处理记录——这是请求真实经过 P→D 链路的
+  证据，仅 Proxy 返回成功不能证明；
+- 池化组合的 Mooncake Master 容器处于运行状态，控制端口可访问，并可重发一次
+  相同前缀的请求验证 KV Pool 复用。
+
+只有带 `AscendStoreConnector` 的池化组合才执行最后一条，其余 connector 跳过。
+
+以上检查全部通过后才报告 `ready`；任一项失败按 `common.md` 第 4 节报告
+`partially_started` 或 `failed`。

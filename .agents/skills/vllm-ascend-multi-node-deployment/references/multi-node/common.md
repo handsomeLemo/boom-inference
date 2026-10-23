@@ -140,7 +140,9 @@ docker exec --detach \
 在第 2 节预检通过后，按部署类型读取对应模式文档（普通多机见 [multi-node-deployment.md](multi-node-deployment.md)，PD 分离多机见 [multi-node-PD-disaggregated-deployment.md](multi-node-PD-disaggregated-deployment.md)），获得具体部署配置和部署策略，并按其启动顺序通过 SSH 执行部署：
 
 - **multi-node deployment**：先启动 Master，只确认容器和主进程没有立即退出、日志没有明显的参数或环境错误，然后立即并行启动全部 Worker。Master 和 Worker 同属一个分布式启动组，Worker 启动前不等待 DP RPC、HTTP API 或模型 readiness，这些检查在全部节点启动后统一执行；
-- **multi-node PD-disaggregated deployment**：先启动 KV Transfer/Mooncake，等待其 readiness 通过后并行启动全部 Prefill 和 Decode，全部 P/D 就绪后再启动 Proxy。
+- **multi-node PD-disaggregated deployment**：池化组合先启动 Mooncake Master 并通过
+  readiness，非池化组合跳过这一步；然后按依赖顺序启动全部 Prefill 和 Decode，
+  全部 P/D 就绪后再启动 Proxy。
 
 发生明确失败时停止后续启动，进入精确清理。清理前在每个节点重新检查容器：
 
@@ -152,7 +154,7 @@ docker ps -a --format '{{.Names}}\t{{.Status}}'
 
 ```text
 multi-node deployment：Worker → Master
-multi-node PD-disaggregated deployment：Proxy → Decode/Prefill → KV Transfer/Mooncake
+multi-node PD-disaggregated deployment：Proxy → Decode/Prefill → Mooncake Master（仅池化组合）
 ```
 
 禁止使用 `pkill`、宽范围 `docker rm`、猜测容器 ID 或把端口占用者当作本次部署的服务。
